@@ -277,9 +277,9 @@ async def cell_click(sid, data):
                 "by": sid
             }, room=room_id)
 
-        total_non_mine = room.rows * room.cols - room.mines
-        # 当前玩家独立计数：率先翻开全部非雷格即获胜
-        if len(revealed_set) >= total_non_mine:
+        total_cells = room.rows * room.cols
+        # 获胜条件：该玩家翻开的格子 + 地雷总数 = 棋盘总格子（所有安全格全部翻开）
+        if len(revealed_set) + room.mines == total_cells:
             room.game_started = False
             room.current_turn = None
             opponent_sid = next(p for p in room.players if p != sid)
