@@ -48,9 +48,12 @@ class Room:
         self.current_turn = None
         self.rematch_votes = set()
         self.first_click_done = False
-        # 每名玩家独立统计已翻开的安全格子
-        self.host_revealed: Set[tuple] = set()
-        self.guest_revealed: Set[tuple] = set()
+        # 全局已翻开集合（防止不同玩家重复翻开同一格）
+        self.global_revealed: Set[tuple] = set()
+        # 每名玩家独立统计已翻开的安全格子（sid → {(r,c), ...}）
+        self.player_safe_cells: Dict[str, Set[tuple]] = {}
+        # 棋盘总安全格子数（行×列 - 雷数），创建房间时算好
+        self.total_safe_cells = rows * cols - mines
 
 rooms: Dict[str, Room] = {}
 sid_info: Dict[str, dict] = {}
@@ -87,27 +90,33 @@ def random_room_id():
 def random_token():
     return '%08x%08x' % (random.getrandbits(32), random.getrandbits(32))
 
-def reveal_cell(board, row, col, revealed_set):
+def reveal_cell(board, row, col, global_set, player_set):
+    """BFS 自动展开。global_set 防重复翻开，player_set 写入当前玩家名下的新格子。
+    返回 (new_cells, affected_safe_cells) — new_cells 是所有新翻开的，affected_safe_cells 仅安全格。"""
     rows = len(board)
     cols = len(board[0])
-    new_revealed = []
+    new_cells = []
+    safe_count = 0
     queue = [(row, col)]
     visited = set()
     while queue:
         r, c = queue.pop(0)
-        if (r, c) in visited or (r, c) in revealed_set:
+        if (r, c) in visited or (r, c) in global_set:
             continue
         visited.add((r, c))
         cell = board[r][c]
-        new_revealed.append((r, c, cell))
-        revealed_set.add((r, c))
+        new_cells.append((r, c, cell))
+        global_set.add((r, c))
+        player_set.add((r, c))
+        if cell >= 0:
+            safe_count += 1
         if cell == 0:
             for dr in (-1, 0, 1):
                 for dc in (-1, 0, 1):
                     nr, nc = r + dr, c + dc
                     if 0 <= nr < rows and 0 <= nc < cols:
                         queue.append((nr, nc))
-    return new_revealed
+    return new_cells, safe_count
 
 @app.post("/create_room")
 async def create_room(payload: dict = None):
@@ -212,6 +221,7 @@ async def join_room_event(sid, data):
                 "rows": room.rows,
                 "cols": room.cols,
                 "mines": room.mines,
+                "total_safe_cells": room.total_safe_cells,
             }, room=room_id)
             await sio.emit("turn_changed", {"current_turn": room.current_turn}, room=room_id)
             print(f"[GAME_START] room={room_id}, current_turn={room.current_turn}")
@@ -234,14 +244,15 @@ async def cell_click(sid, data):
         await sio.emit("error", {"msg": "还没轮到你操作"}, to=sid)
         return
 
-    # 确定当前玩家身份（host 或 guest）
-    player_token = sid_info[sid]["token"]
-    is_host = player_token == room.host_token
-    revealed_set = room.host_revealed if is_host else room.guest_revealed
+    # 确保该玩家的独立统计集合存在
+    if sid not in room.player_safe_cells:
+        room.player_safe_cells[sid] = set()
+    player_set = room.player_safe_cells[sid]
 
     row, col = data["row"], data["col"]
     board = room.board
 
+    # 首次点击安全防护
     if not room.first_click_done:
         room.first_click_done = True
         if board[row][col] == -1:
@@ -259,17 +270,23 @@ async def cell_click(sid, data):
         room.game_started = False
         room.current_turn = None
         opponent_sid = next(p for p in room.players if p != sid)
+        # 收集双方进度
+        final_progress = {}
+        for psid in room.players:
+            final_progress[psid] = len(room.player_safe_cells.get(psid, set()))
         await sio.emit("game_over", {
-            "type": "mine",
-            "loser_sid": sid,
-            "winner_sid": opponent_sid,
+            "winner": opponent_sid,
+            "loser": sid,
+            "reason": "mine_hit",
+            "final_progress": final_progress,
+            "total_safe": room.total_safe_cells,
             "row": row,
             "col": col,
         }, room=room_id)
+        print(f"[GAME_OVER] mine_hit: winner={opponent_sid} loser={sid}")
     else:
-        new_revealed = reveal_cell(board, row, col, revealed_set)
-        for r, c, val in new_revealed:
-            revealed_set.add((r, c))
+        new_cells, safe_count = reveal_cell(board, row, col, room.global_revealed, player_set)
+        for r, c, val in new_cells:
             await sio.emit("cell_revealed", {
                 "row": r,
                 "col": c,
@@ -277,23 +294,28 @@ async def cell_click(sid, data):
                 "by": sid
             }, room=room_id)
 
-        total_cells = room.rows * room.cols
-        opened = len(revealed_set)
-        role_tag = "host" if is_host else "guest"
-        print(f"[WIN_CHECK] sid={sid} role={role_tag} opened={opened} mines={room.mines} total={total_cells} sum={opened + room.mines}")
-        # 获胜条件：该玩家翻开的格子 + 地雷总数 >= 棋盘总格子（所有安全格全部翻开）
-        if opened + room.mines >= total_cells:
-            print(f"[WIN] {role_tag} sid={sid} 率先清空安全区域，触发胜利")
+        opened = len(player_set)
+        print(f"[WIN_CHECK] sid={sid} opened={opened} total_safe={room.total_safe_cells}")
+
+        # 获胜条件：当前玩家翻开的安全格数 == 总安全格数
+        if opened >= room.total_safe_cells:
+            print(f"[WIN] sid={sid} 率先清空所有安全格，触发胜利")
             room.game_started = False
             room.current_turn = None
             opponent_sid = next(p for p in room.players if p != sid)
+            final_progress = {}
+            for psid in room.players:
+                final_progress[psid] = len(room.player_safe_cells.get(psid, set()))
             await sio.emit("game_over", {
-                "type": "win",
-                "winner_sid": sid,
-                "loser_sid": opponent_sid,
+                "winner": sid,
+                "loser": opponent_sid,
+                "reason": "all_safe_opened",
+                "final_progress": final_progress,
+                "total_safe": room.total_safe_cells,
                 "row": row,
                 "col": col,
             }, room=room_id)
+            print(f"[GAME_OVER] all_safe_opened: winner={sid} loser={opponent_sid}")
         elif room.game_started:
             room.current_turn = next(p for p in room.players if p != sid)
             await sio.emit("turn_changed", {"current_turn": room.current_turn}, room=room_id)
@@ -320,8 +342,9 @@ async def request_rematch(sid, data):
     if len(room.rematch_votes) >= 2:
         # 重置房间，沿用当前难度配置
         room.board = generate_board(rows=room.rows, cols=room.cols, mines=room.mines)
-        room.host_revealed.clear()
-        room.guest_revealed.clear()
+        room.global_revealed.clear()
+        room.player_safe_cells.clear()
+        room.total_safe_cells = room.rows * room.cols - room.mines
         room.first_click_done = False
         room.game_started = True
         room.rematch_votes.clear()
@@ -350,6 +373,7 @@ async def request_rematch(sid, data):
             "rows": room.rows,
             "cols": room.cols,
             "mines": room.mines,
+            "total_safe_cells": room.total_safe_cells,
         }, room=room.room_id)
         await sio.emit("turn_changed", {"current_turn": room.current_turn}, room=room.room_id)
         print(f"[REMATCH] room={room.room_id}, game restarted")
