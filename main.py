@@ -278,8 +278,12 @@ async def cell_click(sid, data):
             }, room=room_id)
 
         total_cells = room.rows * room.cols
-        # 获胜条件：该玩家翻开的格子 + 地雷总数 = 棋盘总格子（所有安全格全部翻开）
-        if len(revealed_set) + room.mines == total_cells:
+        opened = len(revealed_set)
+        role_tag = "host" if is_host else "guest"
+        print(f"[WIN_CHECK] sid={sid} role={role_tag} opened={opened} mines={room.mines} total={total_cells} sum={opened + room.mines}")
+        # 获胜条件：该玩家翻开的格子 + 地雷总数 >= 棋盘总格子（所有安全格全部翻开）
+        if opened + room.mines >= total_cells:
+            print(f"[WIN] {role_tag} sid={sid} 率先清空安全区域，触发胜利")
             room.game_started = False
             room.current_turn = None
             opponent_sid = next(p for p in room.players if p != sid)
