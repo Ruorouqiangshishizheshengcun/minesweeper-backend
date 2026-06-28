@@ -204,6 +204,7 @@ async def join_room_event(sid, data):
             await sio.emit("game_started", {
                 "message": "对手已加入，游戏开始！",
                 "current_turn": room.current_turn,
+                "host_sid": host_sid,
                 "start_time": int(time.time() * 1000),
                 "rows": room.rows,
                 "cols": room.cols,
@@ -327,6 +328,7 @@ async def request_rematch(sid, data):
         await sio.emit("game_restarted", {
             "board": safe_board,
             "current_turn": room.current_turn,
+            "host_sid": host_sid,
             "rows": room.rows,
             "cols": room.cols,
             "mines": room.mines,
