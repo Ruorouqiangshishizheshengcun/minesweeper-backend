@@ -1,6 +1,7 @@
 import random
 import string
 import time
+import asyncio
 from typing import Dict, Set
 
 from fastapi import FastAPI, HTTPException
@@ -48,15 +49,17 @@ class Room:
         self.current_turn = None
         self.rematch_votes = set()
         self.first_click_done = False
-        # 全局已翻开集合（防止不同玩家重复翻开同一格）
-        self.global_revealed: Set[tuple] = set()
-        # 每名玩家独立统计已翻开的安全格子（sid → {(r,c), ...}）
-        self.player_safe_cells: Dict[str, Set[tuple]] = {}
-        # 棋盘总安全格子数（行×列 - 雷数），创建房间时算好
-        self.total_safe_cells = rows * cols - mines
+        self.revealed_cells: Set[tuple] = set()
+        self.leaver_token = None  # 主动退出玩家的 token，防止 disconnect 重复处理
+        self.player_reveal_count: Dict[str, int] = {}  # sid → 该玩家累计翻开的安全格数
 
 rooms: Dict[str, Room] = {}
 sid_info: Dict[str, dict] = {}
+# token → sid 反向映射，用于重连时快速定位旧sid
+token_to_sid: Dict[str, str] = {}
+# 待定断线任务：{old_sid: asyncio.Task}，5秒内重连则取消
+pending_disconnects: Dict[str, asyncio.Task] = {}
+DISCONNECT_GRACE_SECONDS = 5  # 断线缓冲窗口（秒）
 
 def generate_board(rows=9, cols=9, mines=10):
     """动态尺寸棋盘生成，rows×cols 非必须正方形"""
@@ -90,33 +93,30 @@ def random_room_id():
 def random_token():
     return '%08x%08x' % (random.getrandbits(32), random.getrandbits(32))
 
-def reveal_cell(board, row, col, global_set, player_set):
-    """BFS 自动展开。global_set 防重复翻开，player_set 写入当前玩家名下的新格子。
-    返回 (new_cells, affected_safe_cells) — new_cells 是所有新翻开的，affected_safe_cells 仅安全格。"""
+def reveal_cell(board, row, col, revealed_set):
     rows = len(board)
     cols = len(board[0])
-    new_cells = []
-    safe_count = 0
+    new_revealed = []
     queue = [(row, col)]
     visited = set()
     while queue:
         r, c = queue.pop(0)
-        if (r, c) in visited or (r, c) in global_set:
+        if (r, c) in visited or (r, c) in revealed_set:
             continue
         visited.add((r, c))
         cell = board[r][c]
-        new_cells.append((r, c, cell))
-        global_set.add((r, c))
-        player_set.add((r, c))
-        if cell >= 0:
-            safe_count += 1
+        if cell == -1:
+            # 跳过地雷：地雷不应被 BFS 翻开，也不应计入 revealed_cells
+            continue
+        new_revealed.append((r, c, cell))
+        revealed_set.add((r, c))
         if cell == 0:
             for dr in (-1, 0, 1):
                 for dc in (-1, 0, 1):
                     nr, nc = r + dr, c + dc
                     if 0 <= nr < rows and 0 <= nc < cols:
                         queue.append((nr, nc))
-    return new_cells, safe_count
+    return new_revealed
 
 @app.post("/create_room")
 async def create_room(payload: dict = None):
@@ -157,23 +157,54 @@ async def create_room(payload: dict = None):
         "mines": mines,
     }
 
+@app.get("/room_state/{room_id}")
+async def get_room_state(room_id: str):
+    """获取房间完整状态，用于前端刷新后恢复对局"""
+    room = rooms.get(room_id)
+    if not room:
+        raise HTTPException(404, "房间不存在")
+    
+    # 收集已翻开的格子列表
+    revealed = [[r, c] for r, c in room.revealed_cells]
+    
+    return {
+        "room_id": room.room_id,
+        "board": safe_view(room.board),
+        "rows": room.rows,
+        "cols": room.cols,
+        "mines": room.mines,
+        "game_started": room.game_started,
+        "current_turn": room.current_turn,
+        "player_count": len(room.players),
+        "revealed_cells": revealed,
+    }
+
 @app.post("/join_room")
 async def join_room(payload: dict):
     room_id = payload.get("room_id")
     room = rooms.get(room_id)
     if not room:
         raise HTTPException(404, "房间不存在")
-    if room.guest_token is not None:
+    # 检查可用槽位（支持玩家退出后重新加入）
+    if room.host_token is None:
+        role = 'host'
+    elif room.guest_token is None:
+        role = 'guest'
+    else:
         raise HTTPException(400, "房间已满")
     token = random_token()
-    room.guest_token = token
-    print(f"[JOIN] room={room_id}, guest_token={token}")
+    if role == 'host':
+        room.host_token = token
+    else:
+        room.guest_token = token
+    print(f"[JOIN] room={room_id}, {role}_token={token}")
     return {
         "board": safe_view(room.board),
         "token": token,
         "rows": room.rows,
         "cols": room.cols,
         "mines": room.mines,
+        "role": role,
     }
 
 @sio.event
@@ -198,9 +229,46 @@ async def join_room_event(sid, data):
             print(f"[JOIN_FAIL] sid={sid}, token={token}, host={room.host_token}, guest={room.guest_token}")
             return
 
+        # ---- 重连检测：同一 token 已有旧 sid ----
+        old_sid = token_to_sid.get(token)
+        is_reconnect = old_sid is not None and old_sid != sid
+
+        if is_reconnect:
+            print(f"[RECONNECT] token={token[:8]}..., old_sid={old_sid} → new_sid={sid}")
+            # 取消待定断线任务
+            cancel_task = pending_disconnects.pop(old_sid, None)
+            if cancel_task:
+                cancel_task.cancel()
+                print(f"[RECONNECT] 已取消断线定时器 old_sid={old_sid}")
+            # 替换旧 sid
+            sid_info.pop(old_sid, None)
+            room.players.discard(old_sid)
+            try:
+                await sio.leave_room(old_sid, room_id)
+            except Exception:
+                pass
+
+        # ---- 录入新 sid ----
         sid_info[sid] = {"room_id": room_id, "token": token}
+        token_to_sid[token] = sid
         await sio.enter_room(sid, room_id)
         room.players.add(sid)
+
+        if is_reconnect:
+            # 通知房间内其他玩家：该玩家已重连上线
+            role = "host" if token == room.host_token else "guest"
+            await sio.emit("player_reonline", {
+                "sid": sid,
+                "token": token,
+                "role": role,
+                "message": f"{'房主' if role == 'host' else '对手'}已重新上线",
+            }, room=room_id)
+            # 如果当前回合属于重连玩家，将回合归属 remap 到新 sid
+            if room.current_turn == old_sid:
+                room.current_turn = sid
+            # 全房间同步最新回合归属（修复双方全部显示「对手回合」的bug）
+            await sio.emit("turn_changed", {"current_turn": room.current_turn}, room=room_id)
+            print(f"[RECONNECT] 已推送 player_reonline + turn_changed, room={room_id}, current_turn={room.current_turn}")
 
         await sio.emit("player_joined", {
             "message": f"玩家加入（{len(room.players)}/2）"
@@ -211,17 +279,18 @@ async def join_room_event(sid, data):
         if (room.host_token and room.guest_token and
             len(room.players) >= 2 and not room.game_started):
             room.game_started = True
-            host_sid = next(sid for sid in room.players if sid_info[sid]["token"] == room.host_token)
+            room.player_reveal_count = {}  # 新一局重置双方翻开计数
+            host_sid = next(s for s in room.players if sid_info[s]["token"] == room.host_token)
             room.current_turn = host_sid
             await sio.emit("game_started", {
                 "message": "对手已加入，游戏开始！",
+                "board": safe_view(room.board),
                 "current_turn": room.current_turn,
                 "host_sid": host_sid,
                 "start_time": int(time.time() * 1000),
                 "rows": room.rows,
                 "cols": room.cols,
                 "mines": room.mines,
-                "total_safe_cells": room.total_safe_cells,
             }, room=room_id)
             await sio.emit("turn_changed", {"current_turn": room.current_turn}, room=room_id)
             print(f"[GAME_START] room={room_id}, current_turn={room.current_turn}")
@@ -244,15 +313,9 @@ async def cell_click(sid, data):
         await sio.emit("error", {"msg": "还没轮到你操作"}, to=sid)
         return
 
-    # 确保该玩家的独立统计集合存在
-    if sid not in room.player_safe_cells:
-        room.player_safe_cells[sid] = set()
-    player_set = room.player_safe_cells[sid]
-
     row, col = data["row"], data["col"]
     board = room.board
 
-    # 首次点击安全防护
     if not room.first_click_done:
         room.first_click_done = True
         if board[row][col] == -1:
@@ -266,27 +329,24 @@ async def cell_click(sid, data):
     cell = board[row][col]
 
     if cell == -1:
-        # 踩雷：当前玩家输，对手赢
+        # 踩雷：当前操作玩家判负，对手获胜
         room.game_started = False
         room.current_turn = None
-        opponent_sid = next(p for p in room.players if p != sid)
-        # 收集双方进度
-        final_progress = {}
-        for psid in room.players:
-            final_progress[psid] = len(room.player_safe_cells.get(psid, set()))
+        other_sid = next((p for p in room.players if p != sid), None)
+        print(f"[GAME_OVER] room={room_id}, reason=mine_hit, winner={other_sid}, loser={sid}")
         await sio.emit("game_over", {
-            "winner": opponent_sid,
+            "winner": other_sid,
             "loser": sid,
             "reason": "mine_hit",
-            "final_progress": final_progress,
-            "total_safe": room.total_safe_cells,
+            "total_safe": room.rows * room.cols - room.mines,
+            "winner_progress": room.player_reveal_count.get(other_sid, 0),
+            "loser_progress": room.player_reveal_count.get(sid, 0),
             "row": row,
             "col": col,
         }, room=room_id)
-        print(f"[GAME_OVER] mine_hit: winner={opponent_sid} loser={sid}")
     else:
-        new_cells, safe_count = reveal_cell(board, row, col, room.global_revealed, player_set)
-        for r, c, val in new_cells:
+        new_revealed = reveal_cell(board, row, col, room.revealed_cells)
+        for r, c, val in new_revealed:
             await sio.emit("cell_revealed", {
                 "row": r,
                 "col": c,
@@ -294,31 +354,100 @@ async def cell_click(sid, data):
                 "by": sid
             }, room=room_id)
 
-        opened = len(player_set)
-        print(f"[WIN_CHECK] sid={sid} opened={opened} total_safe={room.total_safe_cells}")
+        # 累计当前玩家的翻开格数
+        room.player_reveal_count[sid] = room.player_reveal_count.get(sid, 0) + len(new_revealed)
 
-        # 获胜条件：当前玩家翻开的安全格数 == 总安全格数
-        if opened >= room.total_safe_cells:
-            print(f"[WIN] sid={sid} 率先清空所有安全格，触发胜利")
+        total_non_mine = room.rows * room.cols - room.mines
+        revealed_count = len(room.revealed_cells)
+        print(f"[CELL_CLICK] room={room_id}, sid={sid}, revealed={revealed_count}/{total_non_mine}, player_counts={dict(room.player_reveal_count)}")
+        if revealed_count >= total_non_mine:
+            # 翻完最后一个安全格：当前回合玩家直接获胜
             room.game_started = False
             room.current_turn = None
-            opponent_sid = next(p for p in room.players if p != sid)
-            final_progress = {}
-            for psid in room.players:
-                final_progress[psid] = len(room.player_safe_cells.get(psid, set()))
+            other_sid = next((p for p in room.players if p != sid), None)
+            print(f"[GAME_OVER] room={room_id}, reason=last_cell_opened, winner={sid}, loser={other_sid}")
             await sio.emit("game_over", {
                 "winner": sid,
-                "loser": opponent_sid,
-                "reason": "all_safe_opened",
-                "final_progress": final_progress,
-                "total_safe": room.total_safe_cells,
-                "row": row,
-                "col": col,
+                "loser": other_sid,
+                "reason": "last_cell_opened",
+                "total_safe": total_non_mine,
+                "winner_progress": room.player_reveal_count.get(sid, 0),
+                "loser_progress": room.player_reveal_count.get(other_sid, 0),
             }, room=room_id)
-            print(f"[GAME_OVER] all_safe_opened: winner={sid} loser={opponent_sid}")
         elif room.game_started:
             room.current_turn = next(p for p in room.players if p != sid)
             await sio.emit("turn_changed", {"current_turn": room.current_turn}, room=room_id)
+
+@sio.event
+async def leave_room(sid, data):
+    """玩家主动点击「返回大厅」退出房间"""
+    print(f"[LEAVE_ROOM] sid={sid}, data={data}")
+    room_id = data.get("room_id")
+    token = data.get("token")
+
+    room = rooms.get(room_id)
+    if not room:
+        await sio.emit("error", {"msg": "房间不存在"}, to=sid)
+        return
+
+    # 验证 token
+    if token != room.host_token and token != room.guest_token:
+        await sio.emit("error", {"msg": "凭据无效"}, to=sid)
+        return
+
+    # 标记该玩家已主动离开（防止后续 disconnect 重复处理）
+    room.leaver_token = token
+
+    # 取消该 sid 的待定断线任务
+    cancel_task = pending_disconnects.pop(sid, None)
+    if cancel_task:
+        cancel_task.cancel()
+        print(f"[LEAVE_ROOM] 已取消断线定时器 sid={sid}")
+
+    # 清理该玩家数据
+    sid_info.pop(sid, None)
+    token_to_sid.pop(token, None)
+    room.players.discard(sid)
+    room.rematch_votes.discard(sid)
+
+    # 离开 socket 房间
+    try:
+        await sio.leave_room(sid, room_id)
+    except Exception:
+        pass
+
+    role = "host" if token == room.host_token else "guest"
+    print(f"[LEAVE_ROOM] room={room_id}, {role} 主动离开, 剩余玩家={room.players}")
+
+    # 清除离开玩家的 token 槽位，允许后续重新加入
+    if token == room.host_token:
+        room.host_token = None
+    else:
+        room.guest_token = None
+
+    # 重置游戏状态（保留棋盘不重新生成，下次加入直接复用）
+    room.game_started = False
+    room.first_click_done = False
+    room.revealed_cells.clear()
+    room.rematch_votes.clear()
+    room.current_turn = None
+    room.player_reveal_count.clear()
+
+    if len(room.players) == 0:
+        # 房间已空，销毁
+        rooms.pop(room_id, None)
+        print(f"[LEAVE_ROOM] room={room_id} 已销毁（无剩余玩家）")
+    else:
+        # 通知剩余玩家：对手已主动下线
+        await sio.emit("opponent_offline", {
+            "leaver_role": role,
+            "message": f"{'房主' if role == 'host' else '对手'}已退出房间",
+            "permanent": True,
+        }, room=room_id)
+        await sio.emit("rematch_votes_update", {
+            "votes": len(room.rematch_votes),
+        }, room=room_id)
+        print(f"[LEAVE_ROOM] 已广播 opponent_offline, room={room_id}")
 
 @sio.event
 async def request_rematch(sid, data):
@@ -342,12 +471,11 @@ async def request_rematch(sid, data):
     if len(room.rematch_votes) >= 2:
         # 重置房间，沿用当前难度配置
         room.board = generate_board(rows=room.rows, cols=room.cols, mines=room.mines)
-        room.global_revealed.clear()
-        room.player_safe_cells.clear()
-        room.total_safe_cells = room.rows * room.cols - room.mines
+        room.revealed_cells.clear()
         room.first_click_done = False
         room.game_started = True
         room.rematch_votes.clear()
+        room.player_reveal_count.clear()
 
         # 重新设定先手（host 先手，若 host 已断开则任意玩家）
         host_sid = None
@@ -373,7 +501,6 @@ async def request_rematch(sid, data):
             "rows": room.rows,
             "cols": room.cols,
             "mines": room.mines,
-            "total_safe_cells": room.total_safe_cells,
         }, room=room.room_id)
         await sio.emit("turn_changed", {"current_turn": room.current_turn}, room=room.room_id)
         print(f"[REMATCH] room={room.room_id}, game restarted")
@@ -407,24 +534,67 @@ async def cancel_rematch(sid, data):
 @sio.event
 async def disconnect(sid):
     print(f"[WS] 断开 {sid}")
-    info = sid_info.pop(sid, None)
-    if info:
-        room_id = info["room_id"]
-        room = rooms.get(room_id)
-        if room:
-            room.players.discard(sid)
-            # 清除该玩家的投票，并通知房间
-            had_votes = sid in room.rematch_votes
-            room.rematch_votes.discard(sid)
-            # 通知对手：对方断开 + 投票信息
-            await sio.emit("opponent_disconnected", {
-                "votes_cleared": had_votes,
-                "remaining_votes": len(room.rematch_votes),
-            }, room=room_id)
-            # 同时清除游戏状态中的投票计数提示
-            await sio.emit("rematch_votes_update", {
-                "votes": len(room.rematch_votes),
-            }, room=room.room_id)
+    info = sid_info.get(sid)
+    if not info:
+        return
+
+    room_id = info["room_id"]
+    token = info.get("token")
+    if not token:
+        return
+
+    print(f"[DISCONNECT_PENDING] sid={sid}, room={room_id}, token={token[:8]}..., 等待{DISCONNECT_GRACE_SECONDS}s窗口期")
+    # 启动延迟断线任务
+    task = asyncio.create_task(
+        _delayed_disconnect(sid, room_id, token)
+    )
+    pending_disconnects[sid] = task
+
+
+async def _delayed_disconnect(sid: str, room_id: str, token: str):
+    """延迟 DISCONNECT_GRACE_SECONDS 秒后执行真正断线"""
+    try:
+        await asyncio.sleep(DISCONNECT_GRACE_SECONDS)
+    except asyncio.CancelledError:
+        print(f"[DISCONNECT_CANCELLED] sid={sid} 在窗口期内重连，取消断线")
+        return
+
+    # 超时未重连 → 真正断开
+    await _do_real_disconnect(room_id, token, sid)
+
+
+async def _do_real_disconnect(room_id: str, token: str, old_sid: str):
+    """延迟执行真正的断线逻辑"""
+    room = rooms.get(room_id)
+    if not room:
+        return
+
+    # 如果该 token 已通过 leave_room 主动退出，跳过（避免重复通知）
+    if room.leaver_token == token:
+        print(f"[DISCONNECT_SKIP] room={room_id}, token 已主动离开，跳过断线处理")
+        return
+
+    # 清除该 sid 的遗留数据
+    sid_info.pop(old_sid, None)
+    token_to_sid.pop(token, None)
+    pending_disconnects.pop(old_sid, None)
+
+    room.players.discard(old_sid)
+    # 清除该玩家的投票
+    had_votes = old_sid in room.rematch_votes
+    room.rematch_votes.discard(old_sid)
+
+    # 通知房间：对方已真正断开
+    await sio.emit("opponent_disconnected", {
+        "votes_cleared": had_votes,
+        "remaining_votes": len(room.rematch_votes),
+        "permanent": True,
+    }, room=room_id)
+    await sio.emit("rematch_votes_update", {
+        "votes": len(room.rematch_votes),
+    }, room=room_id)
+    print(f"[DISCONNECT_FINAL] room={room_id}, old_sid={old_sid}, permanent disconnect")
+
 
 if __name__ == "__main__":
     import uvicorn
